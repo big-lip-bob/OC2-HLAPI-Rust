@@ -23,7 +23,7 @@ pub struct HLAPIBus {
 
 pub type HLAPIDevice = Uuid;
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(tag = "type", content = "data")]
 pub enum HLAPISend {
@@ -33,38 +33,47 @@ pub enum HLAPISend {
         device_id: HLAPIDevice, // hyphenated
         #[serde(rename = "name")]
         method_name: String,
-        parameters: Vec<serde_json::Value>
+        parameters: Vec<serde_json::Value> // TODO: &dyn Serialize ?
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(tag = "type", content = "data")]
 pub enum HLAPIReceive {
     List (Vec<HLAPIDeviceDescriptor>),
     Methods (Vec<HLAPIMethod>),
     Error (String),
-    Result (Vec<String>) // returned values
+    Result (#[serde(default)] Vec<String>) // returned values
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HLAPIDeviceDescriptor {
     pub device_id: HLAPIDevice,
-    #[serde(rename = "typeNames", default)]
-    pub components: Vec<String>
+    #[serde(rename = "typeNames")]
+    pub components: Vec<String> // cannot be empty thus no default
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HLAPIMethod {
     pub name: String,
-    #[serde(default)]
-    pub parameters: Vec<String>, // Must get respected 1:1
-    pub return_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<HLAPIType>, // Must get respected 1:1
+    pub return_type: String, // always here ?
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub return_value_description: Option<String>
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HLAPIType {
+    #[serde(rename = "type")]
+    data: String
 }
 
 impl HLAPIBus {
