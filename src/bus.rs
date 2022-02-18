@@ -1,7 +1,6 @@
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::io::{Result as IOResult, Error as IOError, ErrorKind as IOErrorKind, Write, Read};
-use std::time::Duration;
 use epoll_rs::{Epoll, Opts as PollOpts};
 use serde::{Serialize, Deserialize};
 use serde::{ser::Serialize as SerializeOwned,de::DeserializeOwned};
@@ -121,22 +120,24 @@ impl HLAPIBus {
         Ok(())
     }
 
-    fn check_null<R: Read>(buffer: &mut R) -> IOResult<()> { // Unexpected EOF
-        let mut must_null = [0; 1];
-        let n = buffer.read(&mut must_null)?;
-        if n == 0 || must_null[0] != 0 { Err(IOErrorKind::UnexpectedEof)? } else { Ok(()) }
+    fn check_delim<R: Read>(buffer: &mut R) -> IOResult<()> { // Unexpected EOF
+        let mut delim_buf = [0; DELIM.len()];
+        let bytes_read = buffer.read(&mut delim_buf)?;
+        if bytes_read != DELIM.len() || delim_buf != DELIM {
+            Err(IOErrorKind::UnexpectedEof)?
+        } else { Ok(()) }
     }
 
     fn read<T: DeserializeOwned>(&mut self) -> IOResult<T> {
         self.poller.wait_one()?;
         let mut buffer = StackBufReader::<_, BUF_SIZE>::new(&mut self.handle);
 
-        Self::check_null(&mut buffer)?;
+        Self::check_delim(&mut buffer)?;
 
         let mut deserializer = serde_json::Deserializer::from_reader(&mut buffer);
         let data = T::deserialize(&mut deserializer)?;
 
-        Self::check_null(&mut buffer)?;
+        Self::check_delim(&mut buffer)?;
 
         Ok(data)
     }
