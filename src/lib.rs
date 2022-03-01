@@ -1,3 +1,6 @@
+#![feature(can_vector)]
+#![feature(write_all_vectored)]
+#![feature(io_error_more)]
 #![allow(clippy::try_err)]
 
 use std::fs::File;
@@ -6,14 +9,19 @@ use std::io::{Result as IOResult, Error as IOError, ErrorKind as IOErrorKind, Wr
 use epoll_rs::{Epoll, Opts as PollOpts};
 use serde::{Serialize, Deserialize};
 use serde::{ser::Serialize as SerializeOwned,de::DeserializeOwned};
-use stack_buffer::{StackBufReader, StackBufWriter};
+use stack_buffer::{StackBufReader};
+use std::mem::MaybeUninit;
+use arrayvec::ArrayVec;
 use uuid::Uuid;
 
 /// Used as the delimiter for HLAPI JSON packets
 const DELIM: &[u8] = b"\0";
 
-/// Used in the Lua implementation
-const BUF_SIZE: usize = 1024;
+/// There's no practical limit when sending from Java to OC2 VMs
+const READ_BUF: usize = 4096; // TODO: Benchmark different sizes trough file importing
+
+/// Maximum size for sending buffers, limitation from OC2 VMs to Java, returns an empty error
+const MAX_WRITE: usize = 4096; // TODO: try using buffers and benchmark
 
 /// Main bus path
 const MAIN_BUS: &str = "/dev/hvc0";
@@ -26,6 +34,7 @@ pub struct HLAPIBus {
 pub type HLAPIDevice = Uuid;
 
 #[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 #[serde(tag = "type", content = "data")]
 pub enum HLAPISend {
@@ -35,21 +44,23 @@ pub enum HLAPISend {
         device_id: HLAPIDevice, // hyphenated
         #[serde(rename = "name")]
         method_name: String,
-        parameters: Vec<serde_json::Value> // TODO: &dyn Serialize ?
+        parameters: Vec<!> // TODO: &dyn Serialize ?
     }
 }
 
 #[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 #[serde(tag = "type", content = "data")]
 pub enum HLAPIReceive {
     List (Vec<HLAPIDeviceDescriptor>),
     Methods (Vec<HLAPIMethod>),
-    Error (String),
+    Error (Option<String>),
     Result (#[serde(default)] Vec<String>) // returned values
 }
 
 #[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct HLAPIDeviceDescriptor {
     pub device_id: HLAPIDevice,
@@ -58,10 +69,11 @@ pub struct HLAPIDeviceDescriptor {
 }
 
 #[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct HLAPIMethod {
     pub name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)] // skip_serializing_if = "Vec::is_empty")
     pub parameters: Vec<HLAPIType>, // Must get respected 1:1
     pub return_type: String, // always here ?
 
@@ -72,6 +84,7 @@ pub struct HLAPIMethod {
 }
 
 #[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct HLAPIType {
     #[serde(rename = "type")]
@@ -120,18 +133,25 @@ impl HLAPIBus {
     }
 
     fn write<T: SerializeOwned>(&mut self, data: &T) -> IOResult<()> {
-        let mut buffer = StackBufWriter::<_, BUF_SIZE>::new(&mut self.handle);
+        let mut buffer = ArrayVec::<u8, MAX_WRITE>::new();
 
         buffer.write_all(DELIM)?;
         serde_json::to_writer(&mut buffer, data).map_err::<IOError, _>(|_| IOErrorKind::InvalidData.into())?;
         buffer.write_all(DELIM)?;
 
-        buffer.flush()?;
+        self.handle.write_all(&buffer)?;
+        self.handle.flush()?;
 
         Ok(())
     }
 
-    fn check_delim<R: Read>(buffer: &mut R) -> IOResult<()> { // Unexpected EOF
+    /// Sends DELIM back into the socket, it makes so on the Java side, it clears the buffer, effectively resetting the state
+    fn reset(&mut self) {
+        self.handle.write_all(DELIM)?;
+        self.handle.flush()?;
+    }
+
+    fn check_delim<R: Read>(buffer: &mut R) -> IOResult<()> {
         let mut delim_buf = [0; DELIM.len()];
         let bytes_read = buffer.read(&mut delim_buf)?;
         if bytes_read != DELIM.len() || delim_buf != DELIM {
@@ -141,7 +161,7 @@ impl HLAPIBus {
 
     fn read<T: DeserializeOwned>(&mut self) -> IOResult<T> {
         self.poller.wait_one()?;
-        let mut buffer = StackBufReader::<_, BUF_SIZE>::new(&mut self.handle);
+        let mut buffer = StackBufReader::<_, READ_BUF>::new(&mut self.handle);
 
         Self::check_delim(&mut buffer)?;
 
