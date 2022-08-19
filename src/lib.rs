@@ -9,13 +9,14 @@
 
 pub mod types;
 
+use std::fmt::{Display, Formatter};
 use types::*;
 
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::io::{Result as IOResult, Error as IOError, ErrorKind as IOErrorKind, Write, Read};
 use epoll_rs::{Epoll, Opts as PollOpts};
-use serde::{ser::Serialize, de::DeserializeOwned, Deserialize};
+use serde::{ser::Serialize, de::{ Deserialize, DeserializeOwned, Visitor, SeqAccess, Error}};
 use stack_buffer::{StackBufReader};
 use arrayvec::ArrayVec;
 
@@ -86,9 +87,45 @@ impl HLAPIBus {
         Ok(self.read()?.expect_result().ok_or(IOErrorKind::InvalidData)?)
     }
 
-    // TODO: Fix, [1, 2, 3] yields [u8; 3] and not Iter<u8>, i need to avoid collecting // screw serde
-    /* pub fn raw_call_streamed<Name: AsRef<str> + Serialize, InTuple: Serialize, OutItem: DeserializeOwned, Function: FnMut(OutItem) -> IOResult<()>>
-    (&mut self, device: HLAPIDeviceHandle, method: Name, args: InTuple, function: &mut Function) -> IOResult<()> {
+    pub fn raw_call_streamed<Name: AsRef<str> + Serialize, InTuple: Serialize, OutItem: DeserializeOwned, Function: FnMut(OutItem) -> Result<(), FnError>, FnError>
+    (&mut self, device: HLAPIDeviceHandle, method: Name, args: InTuple, function: &mut Function) -> IOResult<usize> {
+
+        struct Nothing;
+        impl Display for Nothing { fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result { Ok(()) } }
+        fn stream<'de, Deserializer: serde::Deserializer<'de>, Item: Deserialize<'de>, E>(deserializer: Deserializer, function: impl FnMut(Item) -> Result<(), E>) -> Result<usize, Deserializer::Error> {
+            struct StreamingVisitor<Fn, T>(usize, Fn, std::marker::PhantomData<fn(T)>);
+
+            impl<'de, Item: Deserialize<'de>, E, Fn: FnMut(Item) -> Result<(), E>> Visitor<'de> for StreamingVisitor<Fn, Item> {
+                type Value = usize;
+
+                fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
+                    // Error: invalid type: ..., expected
+                    formatter.write_str("a sequence of ")?;
+                    formatter.write_str(std::any::type_name::<Item>())?;
+                    formatter.write_str("'s")?;
+                    Ok(())
+                }
+
+                fn visit_unit<E>(self) -> Result<Self::Value, E> { // In case of a None
+                    Ok(self.0) // assert self.0 == 0
+                }
+
+                fn visit_seq<S: SeqAccess<'de>>(mut self, mut seq: S) -> Result<Self::Value, S::Error> {
+                    while let Some(item) = seq.next_element()? {
+                        self.0 += 1;
+                        (self.1)(item).map_err(|_| S::Error::custom(Nothing))?;
+                    }
+                    Ok(self.0)
+                }
+            }
+
+            // Create the visitor and ask the deserializer to drive it. The
+            // deserializer will call visitor.visit_seq() if a seq is present in
+            // the input data.
+            let visitor = StreamingVisitor(0, function, std::marker::PhantomData);
+            deserializer.deserialize_seq(visitor)
+        }
+
         self.write(&HLAPISend::Invoke {
             device_id: device,
             method_name: method,
@@ -100,18 +137,13 @@ impl HLAPIBus {
 
         Self::check_delim(&mut buffer)?;
 
-        serde_json::Deserializer::from_reader(&mut buffer).into_iter().try_for_each(|result|
-            match result {
-                Ok(item) => function(item), // FnMut(OutItem) -> IOResult<()>
-                Err(_dismissed_parsing_error) => Err(IOErrorKind::InvalidData.into())
-            }
-        )?;
+        let count = stream(&mut serde_json::Deserializer::from_reader(&mut buffer), function).map_err::<IOError, _>(|_| IOErrorKind::InvalidData.into())?;
 
         // Don't forget to check for delim only after using up the iterator
         Self::check_delim(&mut buffer)?;
 
-        Ok(())
-    } */
+        Ok(count)
+    }
 
     fn check_delim<R: Read>(buffer: &mut R) -> IOResult<()> {
         let mut delim_buf = [0; DELIM.len()];
