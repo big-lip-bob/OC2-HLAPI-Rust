@@ -8,7 +8,7 @@ serde = { version = "*", features = ["derive"] } # default-features = false # mi
 serde_json = "*"
 
 arrayvec = "*"
-stack-buffer = "*"
+stack-buffer = { github = "https://github.com/SUPERCILEX/stack-buffer" }# they just *had* to yank it 
 
 uuid = { version = "*", features = ["serde"] }
 
